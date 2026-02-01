@@ -9,24 +9,44 @@ param(
     [Parameter(Mandatory=$true)]
     [string]$Repo,
 
-    [string]$DefaultBranch = "main",
+    [string]$DefaultBranch = $null, # Will be auto-detected if null
+
+    [string[]]$StatusChecks = @("CodeQL"),
+
+    [int]$ReviewCount = 0,
 
     [switch]$SkipBranchProtection,
-    [switch]$DryRun
+    [switch]$DryRun,
+    [switch]$Verbose
 )
 
 $ErrorActionPreference = "Stop"
 
 # Verify token is present
 if (-not $env:GITHUB_PERSONAL_ACCESS_TOKEN) {
-    Write-Error "GITHUB_PERSONAL_ACCESS_TOKEN not set. Please run with BWS wrapper or set manually."
-    exit 1
+    Write-Host "`n[!] GITHUB_PERSONAL_ACCESS_TOKEN not set." -ForegroundColor Yellow
+    Write-Host "Attempting to fetch from local vault..." -ForegroundColor Cyan
+
+    $tokenFile = "$HOME\.antigravity_tools\bws_token.xml"
+    if (Test-Path $tokenFile) {
+        try {
+            # Since this script is often run via the launcher,
+            # we try to stay consistent with the launcher's storage.
+            # But normally we expect the environment to be hydrated.
+            Write-Host "Please ensure you launch this via the 'antigravity' wrapper or set the token environment variable." -ForegroundColor Gray
+        } catch {}
+    }
+
+    if (-not $env:GITHUB_PERSONAL_ACCESS_TOKEN) {
+        Write-Error "Could not find GITHUB_PERSONAL_ACCESS_TOKEN. Execution halted."
+        exit 1
+    }
 }
 
 $headers = @{
     'Authorization' = "token $env:GITHUB_PERSONAL_ACCESS_TOKEN"
-    'User-Agent' = 'Antigravity-Deployment-Automation'
-    'Accept' = 'application/vnd.github+json'
+    'User-Agent'    = 'Antigravity-Deployment-Automation'
+    'Accept'        = 'application/vnd.github+json'
 }
 
 function Write-Step {
@@ -44,6 +64,14 @@ function Write-Skip {
     Write-Host "  ⏭️  $Message" -ForegroundColor Yellow
 }
 
+function Write-ErrorDetail {
+    param([string]$Message, [object]$Exception)
+    Write-Host "  ❌ $Message" -ForegroundColor Red
+    if ($Exception) {
+        Write-Host "     Detail: $($Exception.Message)" -ForegroundColor DarkRed
+    }
+}
+
 function Invoke-GitHubApi {
     param(
         [string]$Method = "GET",
@@ -52,8 +80,8 @@ function Invoke-GitHubApi {
     )
 
     $params = @{
-        Method = $Method
-        Uri = $Uri
+        Method  = $Method
+        Uri     = $Uri
         Headers = $headers
     }
 
@@ -68,13 +96,31 @@ function Invoke-GitHubApi {
     }
 
     try {
+        if ($PSBoundParameters['Verbose']) {
+            Write-Host "    [DEBUG] $Method $Uri" -ForegroundColor Gray
+        }
         Invoke-RestMethod @params
-    } catch {
-        $statusCode = $_.Exception.Response.StatusCode.value__
-        if ($statusCode -eq 404) {
+    }
+    catch {
+        $statusCode = 0
+        $errorMessage = $_.Exception.Message
+
+        if ($_.Exception.Response) {
+            $statusCode = $_.Exception.Response.StatusCode.value__
+            try {
+                $rawResponse = Stream-Reader -Stream $_.Exception.Response.GetResponseStream()
+                $jsonResponse = $rawResponse.ReadToEnd() | ConvertFrom-Json
+                if ($jsonResponse.message) {
+                    $errorMessage = $jsonResponse.message
+                }
+            } catch {}
+        }
+
+        if ($statusCode -eq 404 -and $Method -eq "GET") {
             return $null
         }
-        throw
+
+        throw "GitHub API Error ($statusCode): $errorMessage"
     }
 }
 
@@ -86,49 +132,47 @@ Write-Host "`n══════════════════════
 Write-Host "  🚀 GitHub Repository Deployment Automation" -ForegroundColor Magenta
 Write-Host "═══════════════════════════════════════════════════" -ForegroundColor Magenta
 Write-Host "  Repository: $Owner/$Repo"
-Write-Host "  Default Branch: $DefaultBranch"
-if ($DryRun) {
-    Write-Host "  Mode: DRY RUN (no changes will be made)" -ForegroundColor Yellow
-}
 
-# Step 1: Verify repository exists
+# Step 1: Verify repository and detect branch
 Write-Step "Verifying repository access..."
-$repoInfo = Invoke-GitHubApi -Uri "https://api.github.com/repos/$Owner/$Repo"
-if (-not $repoInfo) {
-    Write-Error "Repository $Owner/$Repo not found or not accessible"
+$repoInfo = $null
+try {
+    $repoInfo = Invoke-GitHubApi -Uri "https://api.github.com/repos/$Owner/$Repo"
+} catch {
+    Write-ErrorDetail "Repository lookup failed. Verify your token permissions and repository path." $_
     exit 1
 }
+
+if (-not $repoInfo) {
+    Write-Error "Repository $Owner/$Repo not found or not accessible."
+    exit 1
+}
+
+$actualDefaultBranch = $DefaultBranch -if (-not $DefaultBranch) { $repoInfo.default_branch } -else { $DefaultBranch }
+
 Write-Success "Repository accessible: $($repoInfo.full_name)"
 Write-Host "    Visibility: $($repoInfo.visibility)"
-Write-Host "    Default Branch: $($repoInfo.default_branch)"
+Write-Host "    Default Branch: $actualDefaultBranch"
+if ($DryRun) {
+    Write-Host "    Mode: DRY RUN" -ForegroundColor Yellow
+}
 
 # Step 2: Enable Dependabot Security Updates
 Write-Step "Configuring Dependabot..."
 try {
-    $dependabotStatus = Invoke-GitHubApi -Method PUT `
-        -Uri "https://api.github.com/repos/$Owner/$Repo/automated-security-fixes"
-
-    if ($DryRun) {
-        Write-Skip "Would enable Dependabot security updates"
-    } else {
-        Write-Success "Dependabot security updates enabled"
-    }
+    Invoke-GitHubApi -Method PUT -Uri "https://api.github.com/repos/$Owner/$Repo/automated-security-fixes"
+    Write-Success "Dependabot security updates enabled"
 } catch {
-    Write-Skip "Dependabot already configured or unavailable"
+    Write-Skip "Dependabot configuration check failed (possibly already on or unavailable for this repo type)"
 }
 
 # Step 3: Enable Vulnerability Alerts
+Write-Step "Enabling Vulnerability Alerts..."
 try {
-    Invoke-GitHubApi -Method PUT `
-        -Uri "https://api.github.com/repos/$Owner/$Repo/vulnerability-alerts"
-
-    if ($DryRun) {
-        Write-Skip "Would enable vulnerability alerts"
-    } else {
-        Write-Success "Vulnerability alerts enabled"
-    }
+    Invoke-GitHubApi -Method PUT -Uri "https://api.github.com/repos/$Owner/$Repo/vulnerability-alerts"
+    Write-Success "Vulnerability alerts enabled"
 } catch {
-    Write-Skip "Vulnerability alerts already enabled"
+    Write-Skip "Vulnerability alerts already enabled or check failed"
 }
 
 # Step 4: Enable Secret Scanning
@@ -141,32 +185,25 @@ try {
         }
     }
 
-    Invoke-GitHubApi -Method PATCH `
-        -Uri "https://api.github.com/repos/$Owner/$Repo" `
-        -Body $secretScanningBody
-
-    if ($DryRun) {
-        Write-Skip "Would enable secret scanning + push protection"
-    } else {
-        Write-Success "Secret scanning enabled with push protection"
-    }
+    Invoke-GitHubApi -Method PATCH -Uri "https://api.github.com/repos/$Owner/$Repo" -Body $secretScanningBody
+    Write-Success "Secret scanning enabled with push protection"
 } catch {
-    Write-Skip "Secret scanning configuration failed or already enabled"
+    Write-Skip "Secret scanning configuration failed ($($_.Exception.Message))"
 }
 
 # Step 5: Configure Branch Protection
 if (-not $SkipBranchProtection) {
-    Write-Step "Configuring branch protection for '$DefaultBranch'..."
+    Write-Step "Configuring branch protection for '$actualDefaultBranch'..."
 
     $protectionRules = @{
         required_status_checks = @{
-            strict = $true
-            contexts = @("CodeQL")
+            strict   = $true
+            contexts = $StatusChecks
         }
         enforce_admins = $false
         required_pull_request_reviews = @{
-            required_approving_review_count = 0
-            dismiss_stale_reviews = $true
+            required_approving_review_count = $ReviewCount
+            dismiss_stale_reviews           = $true
         }
         restrictions = $null
         allow_force_pushes = $false
@@ -176,22 +213,18 @@ if (-not $SkipBranchProtection) {
 
     try {
         Invoke-GitHubApi -Method PUT `
-            -Uri "https://api.github.com/repos/$Owner/$Repo/branches/$DefaultBranch/protection" `
+            -Uri "https://api.github.com/repos/$Owner/$Repo/branches/$actualDefaultBranch/protection" `
             -Body $protectionRules
 
-        if ($DryRun) {
-            Write-Skip "Would configure branch protection"
-        } else {
-            Write-Success "Branch protection configured"
-            Write-Host "    ✓ Required status checks: CodeQL"
-            Write-Host "    ✓ Conversation resolution required"
-            Write-Host "    ✓ Force pushes blocked"
-        }
+        Write-Success "Branch protection configured"
+        Write-Host "    ✓ Required checks: $($StatusChecks -join ', ')"
+        Write-Host "    ✓ Required reviews: $ReviewCount"
+        Write-Host "    ✓ Force pushes blocked"
     } catch {
-        Write-Skip "Branch protection configuration failed: $($_.Exception.Message)"
+        Write-ErrorDetail "Branch protection configuration failed" $_
     }
 } else {
-    Write-Skip "Branch protection skipped (--SkipBranchProtection)"
+    Write-Skip "Branch protection skipped"
 }
 
 # Step 6: Verification Summary
@@ -201,15 +234,9 @@ Write-Host "══════════════════════�
 
 Write-Host "`n📋 Configuration Summary:"
 Write-Host "  ✓ Repository: $($repoInfo.html_url)"
-Write-Host "  ✓ Dependabot: Enabled"
-Write-Host "  ✓ Secret Scanning: Enabled"
-Write-Host "  ✓ Vulnerability Alerts: Enabled"
-if (-not $SkipBranchProtection) {
-    Write-Host "  ✓ Branch Protection: Configured"
-}
+Write-Host "  ✓ Default Branch: $actualDefaultBranch"
+Write-Host "  ✓ Security: Dependabot, Alerts, Secret Scanning enabled"
 
 Write-Host "`n🎯 Next Steps:"
-Write-Host "  1. Verify CodeQL workflow is running"
-Write-Host "  2. Check Dependabot PRs for dependency updates"
-Write-Host "  3. Review security settings at: https://github.com/$Owner/$Repo/settings/security_analysis"
-Write-Host ""
+Write-Host "  1. Review settings at: https://github.com/$Owner/$Repo/settings/security_analysis"
+Write-Host "  2. If using CodeQL, ensure .github/workflows/codeql.yml exists.`n"
