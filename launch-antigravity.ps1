@@ -66,20 +66,44 @@ Write-Host "  🚀 Antigravity Secure Launcher v1.0" -ForegroundColor Magenta
 Write-Host "═══════════════════════════════════════════════════" -ForegroundColor Magenta
 
 # Step 1: Check BWS_ACCESS_TOKEN
+$tokenFile = "$HOME\.antigravity_tools\bws_token.xml"
+$tokenDir = "$HOME\.antigravity_tools"
+
+if (-not (Test-Path $tokenDir)) {
+  New-Item -ItemType Directory -Path $tokenDir -Force | Out-Null
+}
+
 if (-not $env:BWS_ACCESS_TOKEN) {
-  Write-Step "BWS_ACCESS_TOKEN not found in environment" "Yellow"
+  # Try to load from secure disk storage
+  if (Test-Path $tokenFile) {
+    try {
+      $env:BWS_ACCESS_TOKEN = Import-CliXml -Path $tokenFile
+    }
+    catch {
+      Write-Warning "Could not load saved BWS token. It may have been corrupted."
+    }
+  }
+}
+
+if (-not $env:BWS_ACCESS_TOKEN) {
+  Write-Step "BWS_ACCESS_TOKEN not found" "Yellow"
   Write-Host "   This is your Bitwarden Secrets Manager machine token."
-  Write-Host "   You only need to enter this once per session.`n"
+  Write-Host "   It will be saved ENCRYPTED to your Windows profile for future use.`n"
 
   $bwsToken = Read-Host "   Paste your BWS_ACCESS_TOKEN"
 
-  if (-not $bwsToken) {
-    Write-Error "BWS_ACCESS_TOKEN is required to continue."
+  if ($bwsToken -and $bwsToken.Length -gt 10) {
+    $env:BWS_ACCESS_TOKEN = $bwsToken
+    $bwsToken | Export-CliXml -Path $tokenFile
+    Write-Host "   ✓ Token saved securely to $tokenFile" -ForegroundColor Green
+  }
+  else {
+    Write-Error "Invalid BWS_ACCESS_TOKEN provided."
     exit 1
   }
-
-  $env:BWS_ACCESS_TOKEN = $bwsToken
-  Write-Host "   ✓ Token cached for this session" -ForegroundColor Green
+}
+else {
+  Write-Step "BWS_ACCESS_TOKEN loaded from secure storage." "Green"
 }
 
 # Step 2: Check GitHub token health
